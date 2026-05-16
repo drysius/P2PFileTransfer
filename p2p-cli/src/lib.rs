@@ -12,7 +12,6 @@ mod discover;
 mod history;
 mod nat_test;
 mod receive;
-mod resume;
 mod send;
 
 use anyhow::Result;
@@ -128,22 +127,16 @@ async fn run_cli_async(cli: Cli) -> Result<()> {
         Some(cli::Commands::Receive {
             output,
             auto_accept,
+            parallel,
             session,
         }) => {
-            receive::handle_receive(output, auto_accept, session).await?;
+            receive::handle_receive(output, auto_accept, parallel, session).await?;
         }
         Some(cli::Commands::Discover { timeout, port }) => {
             discover::handle_discover(timeout, port).await?;
         }
         Some(cli::Commands::NatTest { stun_server }) => {
             nat_test::handle_nat_test(stun_server).await?;
-        }
-        Some(cli::Commands::Resume {
-            transfer_id,
-            to,
-            path,
-        }) => {
-            resume::handle_resume(transfer_id, to, path).await?;
         }
         Some(cli::Commands::History {
             limit,

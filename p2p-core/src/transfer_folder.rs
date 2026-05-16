@@ -15,15 +15,102 @@ use crate::{
     error::{Error, Result},
     network::tcp::TcpConnection,
     progress::ProgressState,
-    protocol::{CompleteMessage, ConfigMessage, FileMetadata, Message, TransferInfo},
+    protocol::{
+        CompleteMessage, ConfigMessage, FileListChunk, FileMetadata, Message, PartialFileStatus,
+        SyncStatus, TransferInfo,
+    },
     transfer_file::FileTransferSession,
     verification,
     window::WindowConfig,
 };
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::SystemTime,
 };
+
+/// Maximum number of files per TransferInfo/FileListChunk message.
+/// Prevents individual messages from growing too large on directories with many files.
+const FILE_LIST_BATCH_SIZE: usize = 5_000;
+
+// ---------------------------------------------------------------------------
+// Receiver-side sync state
+// ---------------------------------------------------------------------------
+
+/// Persistent state saved on the receiver side after each successful file receive.
+///
+/// Stored as `.p2p_sync_state.json` inside the output directory.
+/// Used to skip files already on disk and to resume partial files.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct ReceiverSyncState {
+    /// Fully received files: relative path → info
+    pub files: HashMap<String, ReceivedFileInfo>,
+    /// Partially received files: relative path → chunk indices already on disk
+    pub partial: HashMap<String, Vec<u64>>,
+}
+
+/// Metadata for a fully received file
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReceivedFileInfo {
+    pub size: u64,
+    pub mtime: u64,
+    /// SHA-256 hex string — verified at receive time
+    pub sha256: String,
+}
+
+impl ReceiverSyncState {
+    const STATE_FILE: &'static str = ".p2p_sync_state.json";
+
+    pub async fn load(output_dir: &Path) -> Self {
+        let path = output_dir.join(Self::STATE_FILE);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub async fn save(&self, output_dir: &Path) {
+        let path = output_dir.join(Self::STATE_FILE);
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = tokio::fs::write(&path, json).await;
+        }
+    }
+
+    /// Returns `true` if the receiver already has this file complete and verified.
+    /// Uses size + mtime as a fast "rsync-style" check.
+    pub fn is_complete(&self, rel_path: &str, size: u64, mtime: u64) -> bool {
+        self.files
+            .get(rel_path)
+            .map(|info| info.size == size && info.mtime == mtime)
+            .unwrap_or(false)
+    }
+
+    /// Returns the chunk indices the receiver already has for a partial file.
+    pub fn partial_chunks(&self, rel_path: &str) -> &[u64] {
+        self.partial
+            .get(rel_path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Record a completed chunk for a partial file.
+    pub fn record_chunk(&mut self, rel_path: &str, chunk_index: u64) {
+        self.partial
+            .entry(rel_path.to_string())
+            .or_default()
+            .push(chunk_index);
+    }
+
+    /// Mark a file as fully received.
+    pub fn mark_complete(&mut self, rel_path: &str, size: u64, mtime: u64, sha256: [u8; 32]) {
+        let hex: String = sha256.iter().map(|b| format!("{:02x}", b)).collect();
+        self.files.insert(
+            rel_path.to_string(),
+            ReceivedFileInfo { size, mtime, sha256: hex },
+        );
+        self.partial.remove(rel_path);
+    }
+}
 use tokio::fs;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
@@ -272,11 +359,13 @@ impl<'a> FolderTransferSession<'a> {
 
                 vec![(PathBuf::from(file_name), file_meta)]
             } else if path.is_dir() {
-                // Folder: scan recursively
+                info!("Scanning {}...", path.display());
                 let files = self.scan_folder(path).await?;
                 if files.is_empty() {
                     return Err(Error::Protocol("Folder is empty".to_string()));
                 }
+                let scan_bytes: u64 = files.iter().map(|(_, m)| m.size).sum();
+                info!("Found {} files ({})", files.len(), crate::bandwidth::format_bandwidth(scan_bytes));
                 files
             } else {
                 return Err(Error::Protocol(
@@ -299,22 +388,79 @@ impl<'a> FolderTransferSession<'a> {
             progress.set_total_bytes(total_bytes);
         }
 
-        // Send transfer info with file list and optional resume point
+        // Send transfer info with file list and optional resume point.
+        // When the file list is very large, stream it as batched FileListChunk messages
+        // to avoid hitting the per-message size limit.
         let is_resuming = resume_point.is_some();
+        let chunked = state.files.len() > FILE_LIST_BATCH_SIZE;
         let transfer_info = TransferInfo {
             transfer_id: self.transfer_id,
-            items: state.files.clone(),
+            items: if chunked { vec![] } else { state.files.clone() },
             resume_from: resume_point,
+            chunked,
+            total_file_count: state.files.len() as u32,
         };
 
         self.connection
             .send_message(&Message::TransferInfo(transfer_info))
             .await?;
 
-        // Wait for ready acknowledgment
+        if chunked {
+            let total_chunks =
+                (state.files.len() + FILE_LIST_BATCH_SIZE - 1) / FILE_LIST_BATCH_SIZE;
+            info!(
+                "Sending file list in {} batches ({} files total)",
+                total_chunks,
+                state.files.len()
+            );
+            for (chunk_index, batch) in state.files.chunks(FILE_LIST_BATCH_SIZE).enumerate() {
+                let chunk_msg = FileListChunk {
+                    transfer_id: self.transfer_id,
+                    chunk_index: chunk_index as u32,
+                    total_chunks: total_chunks as u32,
+                    items: batch.to_vec(),
+                };
+                self.connection
+                    .send_message(&Message::FileListChunk(chunk_msg))
+                    .await?;
+            }
+        }
+
+        // Wait for receiver's SyncStatus (or legacy Ready from older versions).
+        // SyncStatus tells us which files the receiver already has so we can skip them.
         let msg = self.connection.recv_message().await?;
-        if !matches!(msg, Message::Ready) {
-            return Err(Error::Protocol(format!("Expected Ready, got {:?}", msg)));
+        match msg {
+            Message::SyncStatus(sync) => {
+                // Apply skip list — mark files receiver already has as complete
+                let skipped = sync.complete_files.len();
+                for file_index in sync.complete_files {
+                    if !state.completed_files.contains(&(file_index as usize)) {
+                        info!("  ⏭  Skipping file {} (receiver already has it)", file_index);
+                        state.mark_file_complete(file_index as usize);
+                    }
+                }
+                // Apply partial resume — set received chunks so sender skips them
+                for partial in sync.partial_files {
+                    let idx = partial.file_index as usize;
+                    let n = partial.received_chunks.len();
+                    info!("  🔄 Resuming file {} ({} chunks already on receiver)", idx, n);
+                    for chunk in partial.received_chunks {
+                        state.mark_chunk_complete(idx, chunk);
+                    }
+                }
+                if skipped > 0 {
+                    info!("Sync: skipped {} already-complete file(s)", skipped);
+                }
+            }
+            Message::Ready => {
+                // Old receiver — no sync info, transfer everything
+            }
+            other => {
+                return Err(Error::Protocol(format!(
+                    "Expected SyncStatus or Ready, got {:?}",
+                    other
+                )));
+            }
         }
 
         if is_resuming {
@@ -405,7 +551,7 @@ impl<'a> FolderTransferSession<'a> {
     pub async fn receive_folder(
         &mut self,
         output_dir: &Path,
-        state_path: Option<&Path>,
+        _state_path: Option<&Path>,
         mut progress: Option<&mut ProgressState>,
     ) -> Result<()> {
         // Receive transfer info
@@ -419,37 +565,73 @@ impl<'a> FolderTransferSession<'a> {
                 )))
             }
         };
-        if transfer_info.items.is_empty() {
+        // Collect the full file list — may arrive in batched FileListChunk messages
+        // when the sender has too many files to fit in a single TransferInfo message.
+        let all_items: Vec<FileMetadata> = if transfer_info.chunked {
+            let total_chunks = (transfer_info.total_file_count as usize
+                + FILE_LIST_BATCH_SIZE
+                - 1)
+                / FILE_LIST_BATCH_SIZE;
+            info!(
+                "Receiving chunked file list ({} files in {} batches)",
+                transfer_info.total_file_count, total_chunks
+            );
+            let mut items = Vec::with_capacity(transfer_info.total_file_count as usize);
+            for _ in 0..total_chunks {
+                let msg = self.connection.recv_message().await?;
+                match msg {
+                    Message::FileListChunk(chunk) => {
+                        items.extend(chunk.items);
+                    }
+                    _ => {
+                        return Err(Error::Protocol(format!(
+                            "Expected FileListChunk, got {:?}",
+                            msg
+                        )))
+                    }
+                }
+            }
+            items
+        } else {
+            transfer_info.items.clone()
+        };
+
+        if all_items.is_empty() {
             return Err(Error::Protocol("No files in transfer".to_string()));
         }
 
         info!("Starting receive to: {:?}", output_dir);
 
-        // Check if this is a resume transfer
-        let is_resume = transfer_info.resume_from.is_some();
+        // Load persistent sync state — tracks which files were fully/partially received
+        fs::create_dir_all(output_dir).await?;
+        let mut sync_state = ReceiverSyncState::load(output_dir).await;
 
-        // If we have a state file, check if this transfer matches
-        if let Some(state_file) = state_path {
-            if state_file.exists() {
-                match FolderTransferState::load_from_file(state_file).await {
-                    Ok(existing_state) => {
-                        if existing_state.transfer_id == transfer_info.transfer_id {
-                            info!(
-                                "Detected existing transfer {}, resuming automatically",
-                                transfer_info.transfer_id
-                            );
-                            // The resume_from field in transfer_info already contains chunk data
-                        } else {
-                            info!(
-                                "New transfer {}, previous transfer was {}",
-                                transfer_info.transfer_id, existing_state.transfer_id
-                            );
-                        }
-                    }
-                    Err(e) => warn!("Failed to load existing state: {}", e),
+        // Build SyncStatus so the sender knows what to skip / resume
+        let mut complete_files: Vec<u32> = Vec::new();
+        let mut partial_files: Vec<PartialFileStatus> = Vec::new();
+
+        for (idx, file_meta) in all_items.iter().enumerate() {
+            if sync_state.is_complete(&file_meta.path, file_meta.size, file_meta.modified) {
+                complete_files.push(idx as u32);
+                info!("  ✅ Already have: {}", file_meta.path);
+            } else {
+                let chunks = sync_state.partial_chunks(&file_meta.path).to_vec();
+                if !chunks.is_empty() {
+                    info!("  🔄 Partial ({} chunks): {}", chunks.len(), file_meta.path);
+                    partial_files.push(PartialFileStatus {
+                        file_index: idx as u32,
+                        received_chunks: chunks,
+                    });
                 }
             }
         }
+
+        info!(
+            "Sync: {} complete, {} partial, {} to transfer",
+            complete_files.len(),
+            partial_files.len(),
+            all_items.len() - complete_files.len() - partial_files.len()
+        );
 
         // Update the session's transfer_id to match the incoming transfer
         self.transfer_id = transfer_info.transfer_id;
@@ -458,74 +640,47 @@ impl<'a> FolderTransferSession<'a> {
         self.transfer_start = Some(std::time::Instant::now());
         self.total_compressed_bytes = 0;
 
-        if is_resume {
-            info!(
-                "Receiving resumed transfer with {} files",
-                transfer_info.items.len()
-            );
-        } else {
-            info!(
-                "Receiving new transfer with {} files",
-                transfer_info.items.len()
-            );
-        }
+        info!(
+            "Receiving transfer with {} files",
+            all_items.len()
+        );
 
-        // Calculate total size
-        let total_bytes: u64 = transfer_info.items.iter().map(|f| f.size).sum();
+        // Calculate total size (excluding already-complete files for progress)
+        let total_bytes: u64 = all_items.iter().map(|f| f.size).sum();
+        let already_bytes: u64 = complete_files
+            .iter()
+            .filter_map(|&i| all_items.get(i as usize))
+            .map(|f| f.size)
+            .sum();
 
-        // Calculate already-transferred bytes from resume information
-        let mut already_transferred = 0u64;
-        if let Some(ref resume_point) = transfer_info.resume_from {
-            let file_index = resume_point.file_index as usize;
-            // Add bytes from all completed files before the resume point
-            for i in 0..file_index {
-                if i < transfer_info.items.len() {
-                    already_transferred += transfer_info.items[i].size;
-                }
-            }
-            // Add bytes from completed chunks in the current file
-            if file_index < transfer_info.items.len() {
-                let current_file_size = transfer_info.items[file_index].size;
-                let chunk_size = self.config.chunk_size as u64;
-                let total_chunks = (current_file_size + chunk_size - 1) / chunk_size;
-                let completed_chunks = resume_point.completed_chunks.len() as u64;
-                if completed_chunks < total_chunks {
-                    already_transferred += completed_chunks * chunk_size;
-                } else {
-                    already_transferred += current_file_size;
-                }
-                debug!(
-                    "Resume: {} completed chunks ({} bytes) in file {} (total {} chunks)",
-                    completed_chunks, already_transferred, file_index, total_chunks
-                );
-            }
-            info!(
-                "Resume detected: {} bytes already transferred ({:.1}%)",
-                already_transferred,
-                (already_transferred as f64 / total_bytes as f64) * 100.0
-            );
-        }
-
-        // Set total bytes and initialize with already-transferred bytes if resuming
         if let Some(ref mut progress) = progress {
             progress.set_total_bytes(total_bytes);
-            if already_transferred > 0 {
-                progress.add_bytes(already_transferred);
+            if already_bytes > 0 {
+                progress.add_bytes(already_bytes);
             }
         }
 
-        // Create output directory
-        fs::create_dir_all(output_dir).await?;
+        // Send SyncStatus to sender (replaces old Ready message)
+        self.connection
+            .send_message(&Message::SyncStatus(SyncStatus {
+                transfer_id: self.transfer_id,
+                complete_files: complete_files.clone(),
+                partial_files: partial_files.clone(),
+            }))
+            .await?;
 
-        // Send ready acknowledgment
-        self.connection.send_message(&Message::Ready).await?;
+        // Receive each file — skip files the receiver already has
+        let total_files = all_items.len();
 
-        // Receive each file
-        let total_files = transfer_info.items.len();
-
-        for (file_index, file_meta) in transfer_info.items.iter().enumerate() {
+        for (file_index, file_meta) in all_items.iter().enumerate() {
             let relative_path = PathBuf::from(&file_meta.path);
             let full_path = output_dir.join(&relative_path);
+
+            // Skip files the receiver already has complete
+            if complete_files.contains(&(file_index as u32)) {
+                trace!("Skipping already-complete file: {}", relative_path.display());
+                continue;
+            }
 
             info!(
                 "Receiving file {}/{}: {}",
@@ -533,24 +688,49 @@ impl<'a> FolderTransferSession<'a> {
                 total_files,
                 relative_path.display()
             );
+            if let Some(ref mut p) = progress {
+                let short = relative_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file_meta.path.clone());
+                p.set_message(format!("[{}/{}] {}", file_index + 1, total_files, short));
+            }
 
             // Create parent directories
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
 
-            // Calculate expected chunks
-            let expected_chunks = ((file_meta.size + self.config.chunk_size as u64 - 1)
-                / self.config.chunk_size as u64) as u32;
+            // Get already-received chunk indices (for partial resume)
+            let resume_chunks: Vec<u64> = partial_files
+                .iter()
+                .find(|p| p.file_index == file_index as u32)
+                .map(|p| p.received_chunks.clone())
+                .unwrap_or_default();
 
-            // Receive the file using our connection (checksum verification is now done per-file)
-            self.receive_single_file(
-                &full_path,
-                file_index as u32,
-                expected_chunks,
-                progress.as_deref_mut(),
-            )
-            .await?;
+            // Number of chunks the sender will actually send (total minus already received)
+            let total_file_chunks = ((file_meta.size + self.config.chunk_size as u64 - 1)
+                / self.config.chunk_size as u64) as u32;
+            let expected_chunks = total_file_chunks - resume_chunks.len() as u32;
+
+            let file_checksum = self
+                .receive_single_file(
+                    &full_path,
+                    file_index as u32,
+                    expected_chunks,
+                    resume_chunks.as_slice(),
+                    progress.as_deref_mut(),
+                )
+                .await?;
+
+            // Save to sync state so we can skip this file next time
+            sync_state.mark_complete(
+                &file_meta.path,
+                file_meta.size,
+                file_meta.modified,
+                file_checksum,
+            );
+            sync_state.save(output_dir).await;
 
             trace!("File {} complete", relative_path.display());
         }
@@ -603,8 +783,8 @@ impl<'a> FolderTransferSession<'a> {
             // Create window config from settings
             let window_config = WindowConfig {
                 max_window_size: self.config.window_size,
-                ack_timeout: std::time::Duration::from_secs(10),
-                max_retries: 3,
+                ack_timeout: std::time::Duration::from_secs(30),
+                max_retries: 10,
             };
             file_session
                 .send_file_windowed(
@@ -672,19 +852,30 @@ impl<'a> FolderTransferSession<'a> {
         Ok(())
     }
 
-    /// Receive a single file (internal helper)
-    /// Receives chunks, computes checksum, and verifies against sender's checksum
+    /// Receive a single file (internal helper).
+    ///
+    /// `resume_chunks` contains chunk indices the receiver already has on disk (partial resume).
+    /// The sender will skip those chunks so `expected_chunks` is the number we still need to receive.
+    ///
+    /// Returns the SHA-256 checksum of the complete file (for sync state persistence).
     async fn receive_single_file(
         &mut self,
         path: &Path,
         file_index: u32,
         expected_chunks: u32,
+        resume_chunks: &[u64],
         mut progress: Option<&mut ProgressState>,
-    ) -> Result<()> {
+    ) -> Result<[u8; 32]> {
         use crate::compression::Decompressor;
         use crate::transfer_file::ChunkWriter;
 
-        let mut writer = ChunkWriter::new(path, self.config.chunk_size as usize).await?;
+        // Open writer — resume into existing .partial file if we have prior chunks
+        let mut writer = if resume_chunks.is_empty() {
+            ChunkWriter::new(path, self.config.chunk_size as usize).await?
+        } else {
+            ChunkWriter::open_for_resume(path, self.config.chunk_size as usize, resume_chunks)
+                .await?
+        };
 
         // Decompression if enabled
         let mut decompressor: Option<Decompressor> = if self.config.compression_enabled {
@@ -693,12 +884,13 @@ impl<'a> FolderTransferSession<'a> {
             None
         };
 
-        let mut received = 0;
+        let mut received = 0u32;
 
         while received < expected_chunks {
-            // Receive chunk message
+            // Receive chunk message with retry on timeout
             use std::time::Duration;
             use tokio::time::timeout;
+
             let msg = timeout(Duration::from_secs(30), self.connection.recv_message())
                 .await
                 .map_err(|_| Error::Protocol("Chunk receive timeout".to_string()))??;
@@ -745,11 +937,10 @@ impl<'a> FolderTransferSession<'a> {
             }
         }
 
-        // Finalize file and get the computed checksum
+        // Finalize file (rename .partial → final) and get the computed checksum
         let receiver_checksum = writer.finalize().await?;
 
-        // Send receiver's checksum first (same pattern as sender - both send, then both receive)
-        // This allows both messages to be "in flight" simultaneously, reducing latency
+        // Send receiver's checksum first (same pattern as sender — both send, then both receive)
         use crate::protocol::FileChecksumMessage;
         let receiver_checksum_msg = FileChecksumMessage {
             transfer_id: self.transfer_id,
@@ -760,7 +951,7 @@ impl<'a> FolderTransferSession<'a> {
             .send_message(&Message::FileChecksum(receiver_checksum_msg))
             .await?;
 
-        // Now receive sender's checksum message (sender already sent it and is waiting for ours)
+        // Now receive sender's checksum
         let msg = self.connection.recv_message().await?;
         let sender_checksum = match msg {
             Message::FileChecksum(checksum_msg) => {
@@ -780,24 +971,22 @@ impl<'a> FolderTransferSession<'a> {
             }
         };
 
-        // Log the comparison result (for receiver's awareness)
-        if sender_checksum == receiver_checksum {
-            debug!(
-                "File {} checksum match: {:02x?}",
-                file_index,
-                &receiver_checksum[..8]
-            );
-        } else {
-            // Receiver logs mismatch, but sender will detect and handle the error
-            warn!(
+        if sender_checksum != receiver_checksum {
+            return Err(crate::error::Error::Verification(format!(
                 "File {} checksum mismatch: sender={:02x?}, receiver={:02x?}",
                 file_index,
                 &sender_checksum[..8],
                 &receiver_checksum[..8]
-            );
+            )));
         }
 
-        Ok(())
+        debug!(
+            "File {} checksum verified: {:02x?}",
+            file_index,
+            &receiver_checksum[..8]
+        );
+
+        Ok(receiver_checksum)
     }
 
     /// Send a chunk acknowledgment (internal helper)
@@ -820,8 +1009,123 @@ impl<'a> FolderTransferSession<'a> {
             .await
     }
 
+    /// Send a pre-determined group of files to the peer (used for parallel transfers).
+    ///
+    /// Unlike `send()`, this method does not scan the filesystem — the caller provides
+    /// the exact file list and the base path under which they live.
+    pub async fn send_group(
+        &mut self,
+        base_path: &Path,
+        files: Vec<FileMetadata>,
+        mut progress: Option<&mut ProgressState>,
+    ) -> Result<()> {
+        self.transfer_start = Some(std::time::Instant::now());
+        self.total_compressed_bytes = 0;
+
+        let total_files = files.len();
+        let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+
+        if let Some(ref mut p) = progress {
+            p.set_total_bytes(total_bytes);
+        }
+
+        // Stream the file list (may be large — use batching)
+        let chunked = files.len() > FILE_LIST_BATCH_SIZE;
+        let transfer_info = TransferInfo {
+            transfer_id: self.transfer_id,
+            items: if chunked { vec![] } else { files.clone() },
+            resume_from: None,
+            chunked,
+            total_file_count: files.len() as u32,
+        };
+        self.connection
+            .send_message(&Message::TransferInfo(transfer_info))
+            .await?;
+
+        if chunked {
+            let total_chunks = (files.len() + FILE_LIST_BATCH_SIZE - 1) / FILE_LIST_BATCH_SIZE;
+            for (chunk_index, batch) in files.chunks(FILE_LIST_BATCH_SIZE).enumerate() {
+                let chunk_msg = FileListChunk {
+                    transfer_id: self.transfer_id,
+                    chunk_index: chunk_index as u32,
+                    total_chunks: total_chunks as u32,
+                    items: batch.to_vec(),
+                };
+                self.connection
+                    .send_message(&Message::FileListChunk(chunk_msg))
+                    .await?;
+            }
+        }
+
+        // Wait for receiver SyncStatus (or legacy Ready)
+        let msg = self.connection.recv_message().await?;
+        let mut skip_indices: std::collections::HashSet<u32> = Default::default();
+        let mut partial_map: HashMap<u32, Vec<u64>> = HashMap::new();
+        match msg {
+            Message::SyncStatus(sync) => {
+                for idx in sync.complete_files {
+                    skip_indices.insert(idx);
+                }
+                for p in sync.partial_files {
+                    partial_map.insert(p.file_index, p.received_chunks);
+                }
+            }
+            Message::Ready => {}
+            other => {
+                return Err(Error::Protocol(format!(
+                    "Expected SyncStatus or Ready, got {:?}",
+                    other
+                )));
+            }
+        }
+
+        for (file_index, file_meta) in files.iter().enumerate() {
+            let idx = file_index as u32;
+            if skip_indices.contains(&idx) {
+                info!("  ⏭  Skipping {} (receiver already has it)", file_meta.path);
+                continue;
+            }
+            let resume_chunks = partial_map.remove(&idx).unwrap_or_default();
+            let relative_path = PathBuf::from(&file_meta.path);
+            let full_path = base_path.join(&relative_path);
+
+            if let Some(ref mut p) = progress {
+                let short = relative_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file_meta.path.clone());
+                p.set_message(format!("[{}/{}] {}", file_index + 1, total_files, short));
+            }
+
+            self.send_single_file(
+                &full_path,
+                file_index as u32,
+                &resume_chunks,
+                progress.as_deref_mut(),
+                None::<fn(u64)>,
+            )
+            .await?;
+        }
+
+        let duration = self.transfer_start.map(|s| s.elapsed()).unwrap_or_default();
+        let complete_msg = CompleteMessage {
+            transfer_id: self.transfer_id,
+            total_bytes,
+            duration_ms: duration.as_millis() as u64,
+        };
+        self.connection
+            .send_message(&Message::Complete(complete_msg))
+            .await?;
+
+        if let Some(ref mut p) = progress {
+            p.finish();
+        }
+        self.display_transfer_stats(total_files, total_bytes, duration.as_secs_f64(), true);
+        Ok(())
+    }
+
     /// Scan a folder and build file metadata list
-    async fn scan_folder(&self, folder_path: &Path) -> Result<Vec<(PathBuf, FileMetadata)>> {
+    pub async fn scan_folder(&self, folder_path: &Path) -> Result<Vec<(PathBuf, FileMetadata)>> {
         let mut files = Vec::new();
         // Use parent as base so folder name is included in relative paths
         let base_path = folder_path.parent().unwrap_or(folder_path);
@@ -878,6 +1182,49 @@ impl<'a> FolderTransferSession<'a> {
             Ok(())
         })
     }
+}
+
+/// Scan a folder recursively and return `(base_path, Vec<FileMetadata>)`.
+///
+/// `base_path` is the parent of `folder_path` so that the folder name itself
+/// is included in the relative paths stored in `FileMetadata.path`.
+pub async fn scan_folder_for_parallel(
+    folder_path: &Path,
+) -> Result<(PathBuf, Vec<FileMetadata>)> {
+    let base_path = folder_path.parent().unwrap_or(folder_path).to_path_buf();
+    let mut raw: Vec<(PathBuf, FileMetadata)> = Vec::new();
+    FolderTransferSession::scan_folder_recursive(&base_path, folder_path, &mut raw).await?;
+    let files = raw.into_iter().map(|(_, m)| m).collect();
+    Ok((base_path, files))
+}
+
+/// Split a file list into `n` balanced groups (by total bytes) for parallel transfer.
+///
+/// Uses a greedy bin-packing heuristic: sort files largest-first, then assign
+/// each file to the group with the smallest current total.
+pub fn split_files_for_parallel(files: Vec<FileMetadata>, n: usize) -> Vec<Vec<FileMetadata>> {
+    if n <= 1 || files.is_empty() {
+        return vec![files];
+    }
+
+    let mut sorted = files;
+    sorted.sort_by(|a, b| b.size.cmp(&a.size));
+
+    let mut groups: Vec<Vec<FileMetadata>> = (0..n).map(|_| Vec::new()).collect();
+    let mut group_bytes: Vec<u64> = vec![0u64; n];
+
+    for file in sorted {
+        let min_idx = group_bytes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &b)| b)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        group_bytes[min_idx] += file.size;
+        groups[min_idx].push(file);
+    }
+
+    groups.into_iter().filter(|g| !g.is_empty()).collect()
 }
 
 /// Folder transfer state for resume capability

@@ -21,6 +21,7 @@ use crate::{
 };
 use sha2::Digest;
 use std::{
+    collections::HashSet,
     io::SeekFrom,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -32,6 +33,28 @@ use tokio::{
 };
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
+
+/// Returns true if the file extension indicates already-compressed content.
+/// These formats gain nothing from zstd compression and waste CPU trying.
+fn is_precompressed(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some(
+            "gz" | "tgz" | "bz2" | "xz" | "zst" | "lz4" | "lzma" | "br" // compressed archives
+            | "zip" | "7z" | "rar" | "cab" | "arc"                        // archive formats
+            | "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "avif"   // images
+            | "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "m4v"     // video
+            | "mp3" | "aac" | "ogg" | "flac" | "opus" | "m4a" | "wma"    // audio
+            | "pdf"                                                         // PDF (usually compressed)
+            | "docx" | "xlsx" | "pptx" | "odt" | "ods"                    // Office (zip-based)
+            | "vpk" | "pak" | "wad" | "pk3" | "pk4"                       // game archives
+        )
+    )
+}
 
 /// File transfer session for single-file transfers
 /// This is a helper struct that never owns the connection, only borrows it.
@@ -122,24 +145,20 @@ impl<'a> FileTransferSession<'a> {
         }
         debug!("File has {} total chunks", total_chunks);
 
-        // Compression if enabled
-        let mut compressor: Option<AdaptiveCompressor> = if self.config.compression_enabled {
-            let sample_size = if self.config.adaptive_compression {
-                3
+        let done_set: HashSet<u64> = completed_chunks.iter().copied().collect();
+
+        // Compression if enabled — skip entirely for already-compressed formats
+        let mut compressor: Option<AdaptiveCompressor> =
+            if self.config.compression_enabled && !is_precompressed(path) {
+                let sample_size = if self.config.adaptive_compression { 3 } else { 0 };
+                Some(AdaptiveCompressor::new(self.config.compression_level, sample_size))
             } else {
-                0
+                None
             };
-            Some(AdaptiveCompressor::new(
-                self.config.compression_level,
-                sample_size,
-            ))
-        } else {
-            None
-        };
 
         for chunk_index in 0..total_chunks {
             // Skip already completed chunks
-            if completed_chunks.contains(&(chunk_index as u64)) {
+            if done_set.contains(&(chunk_index as u64)) {
                 trace!("Skipping already completed chunk {}", chunk_index);
                 continue;
             }
@@ -184,14 +203,32 @@ impl<'a> FileTransferSession<'a> {
             self.compressed_bytes_sent += chunk_msg.data.len() as u64;
             self.uncompressed_bytes_sent += uncompressed_size;
 
-            self.connection
-                .send_message(&Message::Chunk(chunk_msg))
-                .await?;
+            // Send chunk and retry up to MAX_CHUNK_RETRIES times on ACK timeout
+            const MAX_CHUNK_RETRIES: u32 = 5;
+            let mut attempts = 0u32;
+            let ack = loop {
+                self.connection
+                    .send_message(&Message::Chunk(chunk_msg.clone()))
+                    .await?;
 
-            // Wait for acknowledgment
-            let ack = timeout(Duration::from_secs(10), self.receive_ack())
-                .await
-                .map_err(|_| Error::Protocol("Chunk ack timeout".to_string()))??;
+                match timeout(Duration::from_secs(10), self.receive_ack()).await {
+                    Ok(Ok(ack)) => break ack,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        attempts += 1;
+                        if attempts >= MAX_CHUNK_RETRIES {
+                            return Err(Error::Protocol(format!(
+                                "Chunk {} ack timeout after {} retries",
+                                chunk_index, attempts
+                            )));
+                        }
+                        warn!(
+                            "Chunk {} ack timeout, retrying ({}/{})",
+                            chunk_index, attempts, MAX_CHUNK_RETRIES
+                        );
+                    }
+                }
+            };
 
             if ack != chunk_index {
                 return Err(Error::Protocol(format!(
@@ -278,7 +315,7 @@ impl<'a> FileTransferSession<'a> {
         // Create sliding window
         let mut window = SlidingWindow::new(window_config.clone(), total_chunks);
 
-        // Mark completed chunks in the window
+        // Mark completed chunks in the window (O(n) once, instead of O(n) per chunk)
         for &chunk_index in completed_chunks {
             if chunk_index < total_chunks as u64 {
                 window.mark_completed(chunk_index as u32);
@@ -286,20 +323,14 @@ impl<'a> FileTransferSession<'a> {
             }
         }
 
-        // Compression if enabled
-        let mut compressor: Option<AdaptiveCompressor> = if self.config.compression_enabled {
-            let sample_size = if self.config.adaptive_compression {
-                3
+        // Compression if enabled — skip entirely for already-compressed formats
+        let mut compressor: Option<AdaptiveCompressor> =
+            if self.config.compression_enabled && !is_precompressed(path) {
+                let sample_size = if self.config.adaptive_compression { 3 } else { 0 };
+                Some(AdaptiveCompressor::new(self.config.compression_level, sample_size))
             } else {
-                0
+                None
             };
-            Some(AdaptiveCompressor::new(
-                self.config.compression_level,
-                sample_size,
-            ))
-        } else {
-            None
-        };
 
         // Main transfer loop
         let mut last_progress = 0;
@@ -676,12 +707,65 @@ impl ChunkWriter {
         })
     }
 
+    /// Open an existing `.partial` file for resuming a partial transfer.
+    ///
+    /// Reads the already-received chunks in index order to reconstruct the running
+    /// SHA-256 state so the final checksum will be correct over the whole file.
+    pub async fn open_for_resume(
+        path: &Path,
+        chunk_size: usize,
+        completed_chunks: &[u64],
+    ) -> Result<Self> {
+        // Build the .partial path
+        let mut partial_os = path.as_os_str().to_os_string();
+        partial_os.push(".partial");
+        let partial_path = PathBuf::from(partial_os);
+
+        // Open for writing without truncating existing content
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&partial_path)
+            .await
+            .map_err(|e| {
+                Error::Network(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to open partial file {:?}: {}", partial_path, e),
+                ))
+            })?;
+
+        // Re-hash already-received chunks in order so the running SHA-256 is consistent
+        let mut hasher = sha2::Sha256::new();
+        if !completed_chunks.is_empty() {
+            let mut sorted = completed_chunks.to_vec();
+            sorted.sort_unstable();
+
+            let mut read_file = File::open(&partial_path).await?;
+            for chunk_idx in sorted {
+                read_file
+                    .seek(SeekFrom::Start(chunk_idx * chunk_size as u64))
+                    .await?;
+                let mut buf = vec![0u8; chunk_size];
+                let n = read_file.read(&mut buf).await?;
+                if n > 0 {
+                    hasher.update(&buf[..n]);
+                }
+            }
+        }
+
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            chunk_size,
+            hasher,
+        })
+    }
+
     /// Write a chunk at the specified index and update running checksum
     pub async fn write_chunk(&mut self, index: u32, data: &[u8]) -> Result<()> {
         let offset = index as u64 * self.chunk_size as u64;
         self.file.seek(SeekFrom::Start(offset)).await?;
         self.file.write_all(data).await?;
-        self.file.flush().await?;
 
         // Update running checksum
         self.hasher.update(data);
