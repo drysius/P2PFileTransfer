@@ -31,3 +31,4 @@ transfer_*.json
 /benchmark_data/
 /benchmark_received/
 benchmark_results.txt
+.claude/
