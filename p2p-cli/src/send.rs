@@ -7,7 +7,7 @@ use p2p_core::{
     progress::ProgressState,
     protocol::{Capabilities, ConfigMessage, FileMetadata},
     session::P2PSession,
-    transfer_folder::scan_folder_for_parallel,
+    transfer_folder::{compute_file_checksums, scan_folder_for_parallel},
     Uuid,
 };
 use std::{
@@ -32,6 +32,46 @@ fn make_spinner(msg: &str) -> ProgressBar {
     bar.set_message(msg.to_string());
     bar.enable_steady_tick(std::time::Duration::from_millis(80));
     bar
+}
+
+/// Scan folder (fast metadata) then hash small files with a progress bar.
+/// Returns `(base_path, files_with_checksums)`.
+async fn scan_and_hash(path: &std::path::Path) -> anyhow::Result<(std::path::PathBuf, Vec<FileMetadata>)> {
+    // Phase 1: metadata scan (fast)
+    let sp = make_spinner(&format!("Scanning {}...", path.display()));
+    let (base_path, mut files) = scan_folder_for_parallel(path).await?;
+    sp.finish_and_clear();
+
+    let total_files = files.len();
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+    eprintln!(
+        "✓ Scan complete  {} files  {}",
+        total_files,
+        format_bandwidth(total_bytes)
+    );
+
+    // Phase 2: hash files ≤ 100 MB with a dedicated progress bar
+    let files_to_hash = files.iter().filter(|f| f.size <= 100 * 1024 * 1024).count();
+    let hash_bar = ProgressBar::new(files_to_hash as u64);
+    hash_bar.set_style(
+        ProgressStyle::with_template(
+            "  [Hashing] {bar:35.magenta/white} {pos}/{len} files ({percent}%)",
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏ "),
+    );
+    hash_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let hash_bar_clone = hash_bar.clone();
+    compute_file_checksums(&base_path, &mut files, Some(move |_done, _total| {
+        hash_bar_clone.inc(1);
+    }))
+    .await?;
+
+    hash_bar.finish_and_clear();
+    eprintln!("✓ Hashing complete  ({} files checked)", files_to_hash);
+
+    Ok((base_path, files))
 }
 
 pub async fn handle_send(
@@ -143,17 +183,9 @@ async fn handle_parallel_send(
     _max_retries: u32,
     parallel: usize,
 ) -> Result<()> {
-    let sp = make_spinner(&format!("Scanning {}...", path.display()));
-    let (base_path, mut all_files) = scan_folder_for_parallel(&path).await?;
-    let total_files = all_files.len();
+    let (base_path, mut all_files) = scan_and_hash(&path).await?;
     let total_bytes: u64 = all_files.iter().map(|f| f.size).sum();
-    sp.finish_and_clear();
-    eprintln!(
-        "✓ Scan complete  {} files  {}  ({} connections)",
-        total_files,
-        format_bandwidth(total_bytes),
-        parallel
-    );
+    eprintln!("  {} connections", parallel);
 
     // Sort largest-first: large files distributed immediately, small files fill gaps
     all_files.sort_by(|a, b| b.size.cmp(&a.size));
@@ -290,14 +322,10 @@ async fn handle_dry_run(
         anyhow::bail!("--dry-run only supported for directories");
     }
 
-    // Scan + hash
-    let sp = make_spinner(&format!("Scanning {}...", path.display()));
-    let (_base_path, all_files) = scan_folder_for_parallel(&path).await?;
-    sp.finish_and_clear();
-
+    // Scan + hash (with progress bar)
+    let (_base_path, all_files) = scan_and_hash(&path).await?;
     let total_files = all_files.len();
     let total_bytes: u64 = all_files.iter().map(|f| f.size).sum();
-    eprintln!("✓ Scan complete  {} files  {}", total_files, format_bandwidth(total_bytes));
 
     // Establish a single session to query receiver sync state
     let sp = make_spinner("Connecting to receiver...");

@@ -158,35 +158,50 @@ const CHECKSUM_SIZE_THRESHOLD: u64 = 100 * 1024 * 1024; // 100 MB
 /// Compute SHA-256 for files under `CHECKSUM_SIZE_THRESHOLD`, concurrently (bounded to 8 tasks).
 /// Large files keep `checksum = [0u8; 32]` — receiver uses size+mtime for those.
 /// Fills `FileMetadata.checksum` in-place.
-pub async fn compute_file_checksums(base_path: &Path, files: &mut Vec<FileMetadata>) -> Result<()> {
+///
+/// `on_progress` is called after each file completes with `(files_done, files_total)`.
+pub async fn compute_file_checksums(
+    base_path: &Path,
+    files: &mut Vec<FileMetadata>,
+    on_progress: Option<impl Fn(usize, usize) + Send + Sync + 'static>,
+) -> Result<()> {
     use futures::stream::{self, StreamExt};
+    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+
+    let total = files.len();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let cb: Option<Arc<dyn Fn(usize, usize) + Send + Sync>> =
+        on_progress.map(|f| Arc::new(f) as Arc<dyn Fn(usize, usize) + Send + Sync>);
 
     let results: Vec<(usize, [u8; 32])> = stream::iter(files.iter().enumerate())
         .map(|(idx, meta)| {
             let full = base_path.join(&meta.path);
             let size = meta.size;
+            let counter = counter.clone();
+            let cb = cb.clone();
             async move {
-                if size > CHECKSUM_SIZE_THRESHOLD {
-                    return (idx, [0u8; 32]);
-                }
-                use sha2::{Digest, Sha256};
-                let mut file = match fs::File::open(&full).await {
-                    Ok(f) => f,
-                    Err(_) => return (idx, [0u8; 32]),
-                };
-                let mut hasher = Sha256::new();
-                let mut buf = vec![0u8; 256 * 1024];
-                loop {
-                    let n = match file.read(&mut buf).await {
-                        Ok(n) => n,
-                        Err(_) => break,
+                let hash = if size > CHECKSUM_SIZE_THRESHOLD {
+                    [0u8; 32]
+                } else {
+                    use sha2::{Digest, Sha256};
+                    let mut file = match fs::File::open(&full).await {
+                        Ok(f) => f,
+                        Err(_) => return (idx, [0u8; 32]),
                     };
-                    if n == 0 {
-                        break;
+                    let mut hasher = Sha256::new();
+                    let mut buf = vec![0u8; 256 * 1024];
+                    loop {
+                        let n = match file.read(&mut buf).await {
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if n == 0 { break; }
+                        hasher.update(&buf[..n]);
                     }
-                    hasher.update(&buf[..n]);
-                }
-                let hash: [u8; 32] = hasher.finalize().into();
+                    hasher.finalize().into()
+                };
+                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref f) = cb { f(done, total); }
                 (idx, hash)
             }
         })
@@ -454,7 +469,7 @@ impl<'a> FolderTransferSession<'a> {
                 // Compute SHA-256 upfront so receiver can deduplicate without re-reading files
                 let base = path.parent().unwrap_or(path);
                 let mut metas: Vec<FileMetadata> = raw.into_iter().map(|(_, m)| m).collect();
-                compute_file_checksums(base, &mut metas).await?;
+                compute_file_checksums(base, &mut metas, None::<fn(usize, usize)>).await?;
                 metas.into_iter().map(|m| (PathBuf::from(&m.path), m)).collect()
             } else {
                 return Err(Error::Protocol(
@@ -1345,19 +1360,15 @@ impl<'a> FolderTransferSession<'a> {
 
 /// Scan a folder recursively and return `(base_path, Vec<FileMetadata>)`.
 ///
-/// `base_path` is the parent of `folder_path` so that the folder name itself
-/// is included in the relative paths stored in `FileMetadata.path`.
-///
-/// SHA-256 checksums are computed for every file so the receiver can skip files
-/// it already has (even if mtime differs or the state file is missing).
+/// Only reads filesystem metadata — checksums are NOT computed here.
+/// Call `compute_file_checksums` separately (with a progress bar) when needed.
 pub async fn scan_folder_for_parallel(
     folder_path: &Path,
 ) -> Result<(PathBuf, Vec<FileMetadata>)> {
     let base_path = folder_path.parent().unwrap_or(folder_path).to_path_buf();
     let mut raw: Vec<(PathBuf, FileMetadata)> = Vec::new();
     FolderTransferSession::scan_folder_recursive(&base_path, folder_path, &mut raw).await?;
-    let mut files: Vec<FileMetadata> = raw.into_iter().map(|(_, m)| m).collect();
-    compute_file_checksums(&base_path, &mut files).await?;
+    let files: Vec<FileMetadata> = raw.into_iter().map(|(_, m)| m).collect();
     Ok((base_path, files))
 }
 
