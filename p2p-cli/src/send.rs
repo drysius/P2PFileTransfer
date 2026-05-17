@@ -36,11 +36,16 @@ fn make_spinner(msg: &str) -> ProgressBar {
 
 pub async fn handle_send(
     path: PathBuf,
+    dry_run: bool,
     session_params: SessionParams,
     transfer_params: TransferParams,
 ) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("Path does not exist: {}", path.display());
+    }
+
+    if dry_run {
+        return handle_dry_run(path, session_params, transfer_params).await;
     }
 
     let config = ConfigMessage {
@@ -272,6 +277,126 @@ async fn handle_parallel_send(
                 .join("; ")
         ))
     }
+}
+
+/// Dry-run: scan folder, connect once, exchange file lists with receiver,
+/// print which files need upload vs are already present. No data is transferred.
+async fn handle_dry_run(
+    path: PathBuf,
+    session_params: SessionParams,
+    transfer_params: TransferParams,
+) -> Result<()> {
+    if !path.is_dir() {
+        anyhow::bail!("--dry-run only supported for directories");
+    }
+
+    // Scan + hash
+    let sp = make_spinner(&format!("Scanning {}...", path.display()));
+    let (_base_path, all_files) = scan_folder_for_parallel(&path).await?;
+    sp.finish_and_clear();
+
+    let total_files = all_files.len();
+    let total_bytes: u64 = all_files.iter().map(|f| f.size).sum();
+    eprintln!("✓ Scan complete  {} files  {}", total_files, format_bandwidth(total_bytes));
+
+    // Establish a single session to query receiver sync state
+    let sp = make_spinner("Connecting to receiver...");
+    let config = ConfigMessage {
+        compression_enabled: transfer_params.compress,
+        compression_level: transfer_params.compress_level,
+        adaptive_compression: transfer_params.adaptive,
+        chunk_size: transfer_params.chunk_size * 1024,
+        window_size: transfer_params.window_size,
+        bandwidth_limit: transfer_params.max_speed,
+    };
+    let peer = session_params.peer.clone();
+    let port = session_params.port;
+    let role = session_params.get_role("client");
+    let discover = session_params.discover;
+
+    let mut session = P2PSession::establish(
+        &role,
+        peer,
+        discover,
+        port,
+        Uuid::new_v4(),
+        Capabilities::all(),
+        Some(config),
+    )
+    .await?;
+    sp.finish_and_clear();
+
+    // Query receiver for its sync state
+    let sp = make_spinner("Querying receiver...");
+    let (complete_indices, partial_indices): (Vec<u32>, Vec<_>) =
+        session.query_sync_status(&all_files).await?;
+    sp.finish_and_clear();
+    // session drops here — EOF causes receiver to break its batch loop cleanly
+
+    // Build lookup sets
+    let complete_set: std::collections::HashSet<u32> = complete_indices.into_iter().collect();
+    let partial_set: std::collections::HashSet<u32> =
+        partial_indices.iter().map(|p| p.file_index).collect();
+
+    // Categorise files
+    let mut to_upload: Vec<&FileMetadata> = Vec::new();
+    let mut partial: Vec<&FileMetadata> = Vec::new();
+    let mut already_have: Vec<&FileMetadata> = Vec::new();
+
+    for (idx, f) in all_files.iter().enumerate() {
+        let idx = idx as u32;
+        if complete_set.contains(&idx) {
+            already_have.push(f);
+        } else if partial_set.contains(&idx) {
+            partial.push(f);
+        } else {
+            to_upload.push(f);
+        }
+    }
+
+    let upload_bytes: u64 = to_upload.iter().map(|f| f.size).sum();
+    let partial_bytes: u64 = partial.iter().map(|f| f.size).sum();
+    let done_bytes: u64 = already_have.iter().map(|f| f.size).sum();
+
+    eprintln!("\n── Dry-run results ──────────────────────────────");
+    eprintln!(
+        "  To upload   : {:>7} files  {}",
+        to_upload.len(),
+        format_bandwidth(upload_bytes)
+    );
+    eprintln!(
+        "  Partial     : {:>7} files  {}  (will resume)",
+        partial.len(),
+        format_bandwidth(partial_bytes)
+    );
+    eprintln!(
+        "  Already have: {:>7} files  {}  (will skip)",
+        already_have.len(),
+        format_bandwidth(done_bytes)
+    );
+    eprintln!("─────────────────────────────────────────────────");
+    eprintln!(
+        "  Total       : {:>7} files  {}",
+        total_files,
+        format_bandwidth(total_bytes)
+    );
+
+    // Show individual files only if set is small enough to be readable
+    const LIST_THRESHOLD: usize = 200;
+    if to_upload.len() <= LIST_THRESHOLD {
+        eprintln!("\nFiles to upload:");
+        for f in &to_upload {
+            eprintln!("  ↑  {}  ({})", f.path, format_bandwidth(f.size));
+        }
+    }
+    if partial.len() <= LIST_THRESHOLD {
+        eprintln!("\nPartial (resume):");
+        for f in &partial {
+            eprintln!("  ↻  {}  ({})", f.path, format_bandwidth(f.size));
+        }
+    }
+
+    Ok(())
 }
 
 async fn send_path(session: &mut P2PSession, path: &Path, max_retries: u32) -> Result<()> {

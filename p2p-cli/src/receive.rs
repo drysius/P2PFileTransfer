@@ -34,6 +34,7 @@ pub async fn handle_receive(
     output: PathBuf,
     auto_accept: bool,
     parallel: usize,
+    connect_timeout: u64,
     session_params: SessionParams,
 ) -> Result<()> {
     info!("📥 Starting receive mode");
@@ -51,7 +52,7 @@ pub async fn handle_receive(
     let parallel = parallel.max(1);
 
     if parallel > 1 && role == "server" {
-        handle_parallel_receive(output, parallel, session_params).await
+        handle_parallel_receive(output, parallel, connect_timeout, session_params).await
     } else {
         handle_single_receive(output, auto_accept, session_params).await
     }
@@ -125,6 +126,7 @@ async fn handle_single_receive(
 async fn handle_parallel_receive(
     output: PathBuf,
     parallel: usize,
+    connect_timeout: u64,
     session_params: SessionParams,
 ) -> Result<()> {
     info!(
@@ -157,17 +159,19 @@ async fn handle_parallel_receive(
     let mut handles = Vec::new();
 
     // Each sender task connects once. If a sender task fails before connecting,
-    // we would hang here forever. Apply a generous per-connection accept timeout.
+    // we would hang here forever. Apply a per-connection accept timeout.
+    // The default (3600 s) is generous enough to cover large folder scans on the sender.
     for idx in 0..parallel {
         let conn = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(connect_timeout),
             server.accept(),
         )
         .await
         .map_err(|_| anyhow::anyhow!(
-            "Timed out waiting for connection {} of {} (120 s). \
-             Sender may have failed to establish all {} connections.",
-            idx + 1, parallel, parallel
+            "Timed out waiting for connection {} of {} ({} s). \
+             Sender may have failed to establish all {} connections. \
+             Increase --connect-timeout if the sender's folder scan takes longer.",
+            idx + 1, parallel, connect_timeout, parallel
         ))??;
         let device_id = Uuid::new_v4();
         let capabilities = Capabilities::all();

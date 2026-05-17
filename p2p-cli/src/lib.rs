@@ -119,18 +119,20 @@ async fn run_cli_async(cli: Cli) -> Result<()> {
         }
         Some(cli::Commands::Send {
             path,
+            dry_run,
             session,
             transfer,
         }) => {
-            send::handle_send(path, session, transfer).await?;
+            send::handle_send(path, dry_run, session, transfer).await?;
         }
         Some(cli::Commands::Receive {
             output,
             auto_accept,
             parallel,
+            connect_timeout,
             session,
         }) => {
-            receive::handle_receive(output, auto_accept, parallel, session).await?;
+            receive::handle_receive(output, auto_accept, parallel, connect_timeout, session).await?;
         }
         Some(cli::Commands::Discover { timeout, port }) => {
             discover::handle_discover(timeout, port).await?;

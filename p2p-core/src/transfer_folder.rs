@@ -1123,6 +1123,51 @@ impl<'a> FolderTransferSession<'a> {
             .await
     }
 
+    /// Send the file list to the receiver and return its sync status without transferring data.
+    ///
+    /// Used by `--dry-run`: caller can inspect which files the receiver already has and
+    /// display the diff, then drop the session (EOF causes receiver to break its loop cleanly).
+    pub async fn query_sync_status(
+        &mut self,
+        files: &[FileMetadata],
+    ) -> Result<(Vec<u32>, Vec<PartialFileStatus>)> {
+        let chunked = files.len() > FILE_LIST_BATCH_SIZE;
+        let transfer_info = TransferInfo {
+            transfer_id: self.transfer_id,
+            items: if chunked { vec![] } else { files.to_vec() },
+            resume_from: None,
+            chunked,
+            total_file_count: files.len() as u32,
+        };
+        self.connection
+            .send_message(&Message::TransferInfo(transfer_info))
+            .await?;
+
+        if chunked {
+            let total_chunks = (files.len() + FILE_LIST_BATCH_SIZE - 1) / FILE_LIST_BATCH_SIZE;
+            for (chunk_index, batch) in files.chunks(FILE_LIST_BATCH_SIZE).enumerate() {
+                let chunk_msg = FileListChunk {
+                    transfer_id: self.transfer_id,
+                    chunk_index: chunk_index as u32,
+                    total_chunks: total_chunks as u32,
+                    items: batch.to_vec(),
+                };
+                self.connection
+                    .send_message(&Message::FileListChunk(chunk_msg))
+                    .await?;
+            }
+        }
+
+        match self.connection.recv_message().await? {
+            Message::SyncStatus(sync) => Ok((sync.complete_files, sync.partial_files)),
+            Message::Ready => Ok((vec![], vec![])),
+            other => Err(Error::Protocol(format!(
+                "Expected SyncStatus, got {:?}",
+                other
+            ))),
+        }
+    }
+
     /// Send a pre-determined group of files to the peer (used for parallel transfers).
     ///
     /// Unlike `send()`, this method does not scan the filesystem — the caller provides

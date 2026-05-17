@@ -116,6 +116,11 @@ pub enum Commands {
         /// File or folder to send
         path: PathBuf,
 
+        /// Scan and compare with receiver without transferring any data.
+        /// Opens one connection, exchanges file lists, prints which files need upload vs already present.
+        #[arg(long)]
+        dry_run: bool,
+
         #[command(flatten)]
         session: SessionParams,
 
@@ -140,6 +145,10 @@ pub enum Commands {
         /// Number of parallel sender connections to accept (must match sender --parallel)
         #[arg(long, default_value = "1")]
         parallel: usize,
+
+        /// Seconds to wait for each sender connection before giving up (default: 3600)
+        #[arg(long, default_value = "3600")]
+        connect_timeout: u64,
 
         #[command(flatten)]
         session: SessionParams,

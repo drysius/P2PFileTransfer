@@ -540,6 +540,22 @@ impl P2PSession {
         folder_session.send_group(base_path, files, progress).await
     }
 
+    /// Send file list to receiver and return its sync status (complete + partial indices).
+    /// Used by `--dry-run`: caller inspects the diff and drops the session without sending data.
+    pub async fn query_sync_status(
+        &mut self,
+        files: &[FileMetadata],
+    ) -> Result<(Vec<u32>, Vec<crate::protocol::PartialFileStatus>)> {
+        use crate::transfer_folder::FolderTransferSession;
+        let transfer_id = Uuid::new_v4();
+        let mut folder_session = FolderTransferSession::new(
+            &mut self.connection,
+            self.handshake.config.clone(),
+            transfer_id,
+        );
+        folder_session.query_sync_status(files).await
+    }
+
     /// Receive a file or folder from the peer
     ///
     /// This operation can be called by either peer, regardless of who
