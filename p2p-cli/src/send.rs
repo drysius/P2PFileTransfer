@@ -185,26 +185,30 @@ async fn handle_parallel_send(
 ) -> Result<()> {
     let (base_path, mut all_files) = scan_and_hash(&path).await?;
     let total_bytes: u64 = all_files.iter().map(|f| f.size).sum();
-    eprintln!("  {} connections", parallel);
+    let total_files = all_files.len();
+    eprintln!("  {} connections  {} files", parallel, total_files);
 
-    // Sort largest-first: large files distributed immediately, small files fill gaps
+    // Sort largest-first
     all_files.sort_by(|a, b| b.size.cmp(&a.size));
 
-    // Shared work-stealing queue
     let queue: Arc<tokio::sync::Mutex<VecDeque<FileMetadata>>> =
         Arc::new(tokio::sync::Mutex::new(VecDeque::from(all_files)));
 
-    let multi = MultiProgress::new();
+    // Active connection counter for status bar message
+    let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    let multi = Arc::new(MultiProgress::new());
+
+    // Single overall bar — no per-connection bars
     let overall_bar = multi.add(ProgressBar::new(total_bytes));
     overall_bar.set_style(
         ProgressStyle::with_template(
-            "  [Total ] {bar:35.yellow/white} {bytes}/{total_bytes} ({bytes_per_sec}, ETA: {eta})",
+            "  [Total ] {bar:40.yellow/white} {bytes}/{total_bytes} ({bytes_per_sec}, ETA: {eta}) {msg}",
         )
         .unwrap()
         .progress_chars("█▉▊▋▌▍▎▏ "),
     );
-    overall_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+    overall_bar.enable_steady_tick(std::time::Duration::from_millis(200));
 
     let peer_addr = session_params.peer.clone();
     let port = session_params.port;
@@ -219,18 +223,8 @@ async fn handle_parallel_send(
         let role_clone = role.clone();
         let base_path_clone = base_path.clone();
         let overall_clone = overall_bar.clone();
-
-        // Per-connection bar: length grows as batches are taken from queue
-        let conn_bar = multi.add(ProgressBar::new(0));
-        conn_bar.set_style(
-            ProgressStyle::with_template(&format!(
-                "  [Conn {:>3}] {{bar:32.cyan/blue}} {{bytes}}/{{total_bytes}} ({{bytes_per_sec}}) {{msg}}",
-                idx + 1
-            ))
-            .unwrap()
-            .progress_chars("█▉▊▋▌▍▎▏ "),
-        );
-        conn_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+        let multi_clone = multi.clone();
+        let active_clone = active_count.clone();
 
         let handle = tokio::spawn(async move {
             let device_id = Uuid::new_v4();
@@ -248,6 +242,8 @@ async fn handle_parallel_send(
             .await
             .map_err(|e| anyhow::anyhow!("Connection {}: {}", idx + 1, e))?;
 
+            active_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             loop {
                 let batch = {
                     let mut q = queue_clone.lock().await;
@@ -257,13 +253,23 @@ async fn handle_parallel_send(
                     break;
                 }
 
-                // Extend bar length to include this batch
-                let batch_bytes: u64 = batch.iter().map(|f| f.size).sum();
-                let new_len = conn_bar.length().unwrap_or(0) + batch_bytes;
-                conn_bar.set_length(new_len);
+                // Log the first file in the batch so user sees what's being transferred
+                if let Some(f) = batch.first() {
+                    let name = std::path::Path::new(&f.path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| f.path.clone());
+                    let _ = multi_clone.println(format!(
+                        "  ↑ {} ({})",
+                        name,
+                        format_bandwidth(f.size)
+                    ));
+                }
 
-                let mut progress =
-                    ProgressState::from_bars_persistent(conn_bar.clone(), overall_clone.clone());
+                let ac = active_clone.load(std::sync::atomic::Ordering::Relaxed);
+                overall_clone.set_message(format!("[{} active]", ac));
+
+                let mut progress = ProgressState::from_global_bar(overall_clone.clone());
 
                 session
                     .send_file_group(&base_path_clone, batch, Some(&mut progress))
@@ -271,7 +277,7 @@ async fn handle_parallel_send(
                     .map_err(|e| anyhow::anyhow!("Connection {} failed: {}", idx + 1, e))?;
             }
 
-            conn_bar.finish_with_message("done");
+            active_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             Ok::<(), anyhow::Error>(())
         });
 
@@ -293,12 +299,14 @@ async fn handle_parallel_send(
         }
     }
 
-    overall_bar.finish_with_message("all done");
-
     if errors.is_empty() {
+        overall_bar.finish_with_message("done");
+        let _ = multi.clear();
         eprintln!("✓ All transfers complete");
         Ok(())
     } else {
+        overall_bar.abandon_with_message(format!("{} connection(s) failed", errors.len()));
+        let _ = multi.clear();
         Err(anyhow::anyhow!(
             "{} connection(s) failed: {}",
             errors.len(),

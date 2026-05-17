@@ -59,6 +59,19 @@ impl ProgressState {
         }
     }
 
+    /// Single-bar mode: only advances `global`, no local bar displayed.
+    /// Used when the caller wants one shared overall bar without per-connection bars.
+    pub fn from_global_bar(global: ProgressBar) -> Self {
+        Self {
+            total_bytes: 0,
+            transferred_bytes: 0,
+            progress_bar: ProgressBar::hidden(),
+            global_bar: Some(global),
+            managed: true,
+            no_finish: true,
+        }
+    }
+
     /// Like `from_bars` but the bar persists across multiple batches (queue mode).
     /// `finish()` is a no-op; `set_total_bytes()` only updates local tracking,
     /// not the bar's length (which is managed externally by the queue worker).

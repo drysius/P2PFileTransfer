@@ -31,7 +31,7 @@ impl TcpConnection {
     /// Connect to a remote peer
     pub async fn connect(addr: SocketAddr) -> Result<Self> {
         info!("Connecting to {}", addr);
-        let stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
+        let stream = timeout(Duration::from_secs(30), TcpStream::connect(addr))
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(Error::Network)?;

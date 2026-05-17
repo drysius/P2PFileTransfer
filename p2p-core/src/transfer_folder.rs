@@ -1265,7 +1265,11 @@ impl<'a> FolderTransferSession<'a> {
         for (file_index, file_meta) in files.iter().enumerate() {
             let idx = file_index as u32;
             if skip_indices.contains(&idx) {
-                info!("  ⏭  Skipping {} (receiver already has it)", file_meta.path);
+                trace!("  ⏭  Skipping {} (receiver already has it)", file_meta.path);
+                // Count skipped bytes so overall progress bar reflects true completion
+                if let Some(ref mut p) = progress {
+                    p.add_bytes(file_meta.size);
+                }
                 continue;
             }
             let resume_chunks = partial_map.remove(&idx).unwrap_or_default();
