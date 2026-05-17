@@ -165,49 +165,58 @@ pub async fn compute_file_checksums(
     files: &mut Vec<FileMetadata>,
     on_progress: Option<impl Fn(usize, usize) + Send + Sync + 'static>,
 ) -> Result<()> {
-    use futures::stream::{self, StreamExt};
-    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+    use rayon::prelude::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
-    let total = files.len();
+    // Build list of (index, full_path) only for files that need hashing
+    let to_hash: Vec<(usize, std::path::PathBuf)> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.size <= CHECKSUM_SIZE_THRESHOLD)
+        .map(|(i, m)| (i, base_path.join(&m.path)))
+        .collect();
+
+    let total = to_hash.len();
     let counter = Arc::new(AtomicUsize::new(0));
     let cb: Option<Arc<dyn Fn(usize, usize) + Send + Sync>> =
         on_progress.map(|f| Arc::new(f) as Arc<dyn Fn(usize, usize) + Send + Sync>);
 
-    let results: Vec<(usize, [u8; 32])> = stream::iter(files.iter().enumerate())
-        .map(|(idx, meta)| {
-            let full = base_path.join(&meta.path);
-            let size = meta.size;
-            let counter = counter.clone();
-            let cb = cb.clone();
-            async move {
-                let hash = if size > CHECKSUM_SIZE_THRESHOLD {
-                    [0u8; 32]
-                } else {
-                    use sha2::{Digest, Sha256};
-                    let mut file = match fs::File::open(&full).await {
-                        Ok(f) => f,
-                        Err(_) => return (idx, [0u8; 32]),
-                    };
-                    let mut hasher = Sha256::new();
-                    let mut buf = vec![0u8; 256 * 1024];
-                    loop {
-                        let n = match file.read(&mut buf).await {
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
-                        if n == 0 { break; }
-                        hasher.update(&buf[..n]);
-                    }
-                    hasher.finalize().into()
-                };
+    // Offload CPU-bound SHA-256 work to rayon's thread pool (uses all cores).
+    // spawn_blocking bridges rayon's blocking work back to async.
+    let results: Vec<(usize, [u8; 32])> = tokio::task::spawn_blocking(move || {
+        to_hash
+            .into_par_iter()
+            .map(|(idx, path)| {
+                use sha2::{Digest, Sha256};
+                let hash = std::fs::File::open(&path)
+                    .map(|f| {
+                        let mut reader = std::io::BufReader::with_capacity(256 * 1024, f);
+                        let mut hasher = Sha256::new();
+                        let mut buf = vec![0u8; 256 * 1024];
+                        loop {
+                            use std::io::Read;
+                            match reader.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => hasher.update(&buf[..n]),
+                            }
+                        }
+                        hasher.finalize().into()
+                    })
+                    .unwrap_or([0u8; 32]);
+
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(ref f) = cb { f(done, total); }
+                if let Some(ref f) = cb {
+                    f(done, total);
+                }
                 (idx, hash)
-            }
-        })
-        .buffer_unordered(8)
-        .collect()
-        .await;
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| Error::Protocol(format!("Checksum thread panic: {}", e)))?;
 
     for (idx, hash) in results {
         files[idx].checksum = hash;
