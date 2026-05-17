@@ -36,7 +36,9 @@ fn make_spinner(msg: &str) -> ProgressBar {
 
 /// Scan folder (fast metadata) then hash small files with a progress bar.
 /// Returns `(base_path, files_with_checksums)`.
-async fn scan_and_hash(path: &std::path::Path) -> anyhow::Result<(std::path::PathBuf, Vec<FileMetadata>)> {
+async fn scan_and_hash(
+    path: &std::path::Path,
+) -> anyhow::Result<(std::path::PathBuf, Vec<FileMetadata>)> {
     // Phase 1: metadata scan (fast)
     let sp = make_spinner(&format!("Scanning {}...", path.display()));
     let (base_path, mut files) = scan_folder_for_parallel(path).await?;
@@ -63,9 +65,13 @@ async fn scan_and_hash(path: &std::path::Path) -> anyhow::Result<(std::path::Pat
     hash_bar.enable_steady_tick(std::time::Duration::from_millis(100));
 
     let hash_bar_clone = hash_bar.clone();
-    compute_file_checksums(&base_path, &mut files, Some(move |_done, _total| {
-        hash_bar_clone.inc(1);
-    }))
+    compute_file_checksums(
+        &base_path,
+        &mut files,
+        Some(move |_done, _total| {
+            hash_bar_clone.inc(1);
+        }),
+    )
     .await?;
 
     hash_bar.finish_and_clear();
@@ -100,8 +106,14 @@ pub async fn handle_send(
     let parallel = transfer_params.parallel.max(1);
 
     if parallel > 1 && path.is_dir() {
-        handle_parallel_send(path, session_params, config, transfer_params.max_retries, parallel)
-            .await
+        handle_parallel_send(
+            path,
+            session_params,
+            config,
+            transfer_params.max_retries,
+            parallel,
+        )
+        .await
     } else {
         handle_single_send(path, session_params, config, transfer_params.max_retries).await
     }
@@ -259,11 +271,8 @@ async fn handle_parallel_send(
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| f.path.clone());
-                    let _ = multi_clone.println(format!(
-                        "  ↑ {} ({})",
-                        name,
-                        format_bandwidth(f.size)
-                    ));
+                    let _ =
+                        multi_clone.println(format!("  ↑ {} ({})", name, format_bandwidth(f.size)));
                 }
 
                 let ac = active_clone.load(std::sync::atomic::Ordering::Relaxed);
@@ -439,14 +448,21 @@ async fn send_path(session: &mut P2PSession, path: &Path, max_retries: u32) -> R
     let base_name = path.file_name().unwrap().to_string_lossy().to_string();
 
     let config = session.config();
-    let mode = if config.window_size == 1 { "sequential" } else { "windowed" };
+    let mode = if config.window_size == 1 {
+        "sequential"
+    } else {
+        "windowed"
+    };
     let retry_label = match max_retries {
         0 => "unlimited retries".to_string(),
         1 => "no retry".to_string(),
         n => format!("max {} retries", n),
     };
 
-    eprintln!("↑ {}  mode={}  w={}  {}", base_name, mode, config.window_size, retry_label);
+    eprintln!(
+        "↑ {}  mode={}  w={}  {}",
+        base_name, mode, config.window_size, retry_label
+    );
 
     let mut progress = p2p_core::progress::ProgressState::new(0);
 

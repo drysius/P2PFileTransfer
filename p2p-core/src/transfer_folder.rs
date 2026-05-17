@@ -81,7 +81,13 @@ impl ReceiverSyncState {
     /// If `sender_sha256` is non-zero and the stored state has a SHA-256 for this file,
     /// the decision is based on hash comparison (reliable, mtime-independent).
     /// Otherwise falls back to size + mtime (rsync-style fast check).
-    pub fn is_complete(&self, rel_path: &str, size: u64, mtime: u64, sender_sha256: &[u8; 32]) -> bool {
+    pub fn is_complete(
+        &self,
+        rel_path: &str,
+        size: u64,
+        mtime: u64,
+        sender_sha256: &[u8; 32],
+    ) -> bool {
         match self.files.get(rel_path) {
             None => false,
             Some(info) => {
@@ -92,7 +98,8 @@ impl ReceiverSyncState {
                 if sender_has_hash && !info.sha256.is_empty() {
                     // Compare stored SHA-256 hex with sender's bytes
                     let stored = info.sha256.as_str();
-                    let sender_hex: String = sender_sha256.iter().map(|b| format!("{:02x}", b)).collect();
+                    let sender_hex: String =
+                        sender_sha256.iter().map(|b| format!("{:02x}", b)).collect();
                     stored == sender_hex
                 } else {
                     // Fast path: size already matches, check mtime
@@ -123,7 +130,11 @@ impl ReceiverSyncState {
         let hex: String = sha256.iter().map(|b| format!("{:02x}", b)).collect();
         self.files.insert(
             rel_path.to_string(),
-            ReceivedFileInfo { size, mtime, sha256: hex },
+            ReceivedFileInfo {
+                size,
+                mtime,
+                sha256: hex,
+            },
         );
         self.partial.remove(rel_path);
     }
@@ -146,7 +157,11 @@ async fn hash_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect())
 }
 
 /// Files larger than this threshold skip pre-scan SHA-256; receiver falls back to size+mtime.
@@ -474,12 +489,19 @@ impl<'a> FolderTransferSession<'a> {
                     return Err(Error::Protocol("Folder is empty".to_string()));
                 }
                 let scan_bytes: u64 = raw.iter().map(|(_, m)| m.size).sum();
-                info!("Found {} files ({})", raw.len(), crate::bandwidth::format_bandwidth(scan_bytes));
+                info!(
+                    "Found {} files ({})",
+                    raw.len(),
+                    crate::bandwidth::format_bandwidth(scan_bytes)
+                );
                 // Compute SHA-256 upfront so receiver can deduplicate without re-reading files
                 let base = path.parent().unwrap_or(path);
                 let mut metas: Vec<FileMetadata> = raw.into_iter().map(|(_, m)| m).collect();
                 compute_file_checksums(base, &mut metas, None::<fn(usize, usize)>).await?;
-                metas.into_iter().map(|m| (PathBuf::from(&m.path), m)).collect()
+                metas
+                    .into_iter()
+                    .map(|m| (PathBuf::from(&m.path), m))
+                    .collect()
             } else {
                 return Err(Error::Protocol(
                     "Path is neither a file nor a directory".to_string(),
@@ -548,7 +570,10 @@ impl<'a> FolderTransferSession<'a> {
                 let skipped = sync.complete_files.len();
                 for file_index in sync.complete_files {
                     if !state.completed_files.contains(&(file_index as usize)) {
-                        info!("  ⏭  Skipping file {} (receiver already has it)", file_index);
+                        info!(
+                            "  ⏭  Skipping file {} (receiver already has it)",
+                            file_index
+                        );
                         state.mark_file_complete(file_index as usize);
                     }
                 }
@@ -556,7 +581,10 @@ impl<'a> FolderTransferSession<'a> {
                 for partial in sync.partial_files {
                     let idx = partial.file_index as usize;
                     let n = partial.received_chunks.len();
-                    info!("  🔄 Resuming file {} ({} chunks already on receiver)", idx, n);
+                    info!(
+                        "  🔄 Resuming file {} ({} chunks already on receiver)",
+                        idx, n
+                    );
                     for chunk in partial.received_chunks {
                         state.mark_chunk_complete(idx, chunk);
                     }
@@ -681,9 +709,7 @@ impl<'a> FolderTransferSession<'a> {
         // Collect the full file list — may arrive in batched FileListChunk messages
         // when the sender has too many files to fit in a single TransferInfo message.
         let all_items: Vec<FileMetadata> = if transfer_info.chunked {
-            let total_chunks = (transfer_info.total_file_count as usize
-                + FILE_LIST_BATCH_SIZE
-                - 1)
+            let total_chunks = (transfer_info.total_file_count as usize + FILE_LIST_BATCH_SIZE - 1)
                 / FILE_LIST_BATCH_SIZE;
             info!(
                 "Receiving chunked file list ({} files in {} batches)",
@@ -724,7 +750,12 @@ impl<'a> FolderTransferSession<'a> {
         let mut partial_files: Vec<PartialFileStatus> = Vec::new();
 
         for (idx, file_meta) in all_items.iter().enumerate() {
-            if sync_state.is_complete(&file_meta.path, file_meta.size, file_meta.modified, &file_meta.checksum) {
+            if sync_state.is_complete(
+                &file_meta.path,
+                file_meta.size,
+                file_meta.modified,
+                &file_meta.checksum,
+            ) {
                 complete_files.push(idx as u32);
                 info!("  ✅ Already have: {}", file_meta.path);
             } else {
@@ -737,11 +768,20 @@ impl<'a> FolderTransferSession<'a> {
                     if let Ok(meta) = fs::metadata(&full_path).await {
                         if meta.len() == file_meta.size {
                             if let Ok(hash) = hash_file(&full_path).await {
-                                let sender_hex: String = file_meta.checksum.iter().map(|b| format!("{:02x}", b)).collect();
+                                let sender_hex: String = file_meta
+                                    .checksum
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect();
                                 if hash == sender_hex {
                                     info!("  ✅ Hash match (no state): {}", file_meta.path);
                                     // Record in sync state so future runs use the fast path
-                                    sync_state.mark_complete(&file_meta.path, file_meta.size, file_meta.modified, file_meta.checksum);
+                                    sync_state.mark_complete(
+                                        &file_meta.path,
+                                        file_meta.size,
+                                        file_meta.modified,
+                                        file_meta.checksum,
+                                    );
                                     complete_files.push(idx as u32);
                                     continue;
                                 }
@@ -775,10 +815,7 @@ impl<'a> FolderTransferSession<'a> {
         self.transfer_start = Some(std::time::Instant::now());
         self.total_compressed_bytes = 0;
 
-        info!(
-            "Receiving transfer with {} files",
-            all_items.len()
-        );
+        info!("Receiving transfer with {} files", all_items.len());
 
         // Calculate total size (excluding already-complete files for progress)
         let total_bytes: u64 = all_items.iter().map(|f| f.size).sum();
@@ -813,7 +850,10 @@ impl<'a> FolderTransferSession<'a> {
 
             // Skip files the receiver already has complete
             if complete_files.contains(&(file_index as u32)) {
-                trace!("Skipping already-complete file: {}", relative_path.display());
+                trace!(
+                    "Skipping already-complete file: {}",
+                    relative_path.display()
+                );
                 continue;
             }
 
@@ -1375,9 +1415,7 @@ impl<'a> FolderTransferSession<'a> {
 ///
 /// Only reads filesystem metadata — checksums are NOT computed here.
 /// Call `compute_file_checksums` separately (with a progress bar) when needed.
-pub async fn scan_folder_for_parallel(
-    folder_path: &Path,
-) -> Result<(PathBuf, Vec<FileMetadata>)> {
+pub async fn scan_folder_for_parallel(folder_path: &Path) -> Result<(PathBuf, Vec<FileMetadata>)> {
     let base_path = folder_path.parent().unwrap_or(folder_path).to_path_buf();
     let mut raw: Vec<(PathBuf, FileMetadata)> = Vec::new();
     FolderTransferSession::scan_folder_recursive(&base_path, folder_path, &mut raw).await?;

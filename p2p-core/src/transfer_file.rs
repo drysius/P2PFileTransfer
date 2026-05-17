@@ -51,7 +51,7 @@ fn is_precompressed(path: &Path) -> bool {
             | "mp3" | "aac" | "ogg" | "flac" | "opus" | "m4a" | "wma"    // audio
             | "pdf"                                                         // PDF (usually compressed)
             | "docx" | "xlsx" | "pptx" | "odt" | "ods"                    // Office (zip-based)
-            | "vpk" | "pak" | "wad" | "pk3" | "pk4"                       // game archives
+            | "vpk" | "pak" | "wad" | "pk3" | "pk4" // game archives
         )
     )
 }
@@ -150,8 +150,15 @@ impl<'a> FileTransferSession<'a> {
         // Compression if enabled — skip entirely for already-compressed formats
         let mut compressor: Option<AdaptiveCompressor> =
             if self.config.compression_enabled && !is_precompressed(path) {
-                let sample_size = if self.config.adaptive_compression { 3 } else { 0 };
-                Some(AdaptiveCompressor::new(self.config.compression_level, sample_size))
+                let sample_size = if self.config.adaptive_compression {
+                    3
+                } else {
+                    0
+                };
+                Some(AdaptiveCompressor::new(
+                    self.config.compression_level,
+                    sample_size,
+                ))
             } else {
                 None
             };
@@ -326,8 +333,15 @@ impl<'a> FileTransferSession<'a> {
         // Compression if enabled — skip entirely for already-compressed formats
         let mut compressor: Option<AdaptiveCompressor> =
             if self.config.compression_enabled && !is_precompressed(path) {
-                let sample_size = if self.config.adaptive_compression { 3 } else { 0 };
-                Some(AdaptiveCompressor::new(self.config.compression_level, sample_size))
+                let sample_size = if self.config.adaptive_compression {
+                    3
+                } else {
+                    0
+                };
+                Some(AdaptiveCompressor::new(
+                    self.config.compression_level,
+                    sample_size,
+                ))
             } else {
                 None
             };

@@ -167,12 +167,17 @@ async fn handle_parallel_receive(
             server.accept(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!(
-            "Timed out waiting for connection {} of {} ({} s). \
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timed out waiting for connection {} of {} ({} s). \
              Sender may have failed to establish all {} connections. \
              Increase --connect-timeout if the sender's folder scan takes longer.",
-            idx + 1, parallel, connect_timeout, parallel
-        ))??;
+                idx + 1,
+                parallel,
+                connect_timeout,
+                parallel
+            )
+        })??;
         let device_id = Uuid::new_v4();
         let capabilities = Capabilities::all();
         let output_clone = Arc::clone(&output);
@@ -242,7 +247,11 @@ async fn handle_parallel_receive(
                 }
             }
 
-            info!("Connection {} finished ({} batch(es))", idx + 1, batch_count);
+            info!(
+                "Connection {} finished ({} batch(es))",
+                idx + 1,
+                batch_count
+            );
             Ok::<(), anyhow::Error>(())
         });
 
