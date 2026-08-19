@@ -529,7 +529,7 @@ impl<'a> FileTransferSession<'a> {
             None
         };
 
-        let mut received = 0;
+        let mut received_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut total_chunks: Option<u64> = None;
 
         loop {
@@ -547,30 +547,32 @@ impl<'a> FileTransferSession<'a> {
                     }
 
                     let chunk_index = chunk_msg.chunk_index as u32;
+                    let is_new = received_set.insert(chunk_index);
 
                     // Verify checksum first (fast, must be sync to catch corruption)
                     verification::verify_crc32(&chunk_msg.data, chunk_msg.checksum)?;
 
-                    // Start sending ACK (creates future but doesn't wait yet)
+                    // Always ACK so sender's window advances even for duplicates
                     let ack_future = self.send_ack(chunk_index, AckStatus::Success);
 
-                    // Do expensive operations while ACK is being sent in parallel
-                    let final_data = if let Some(decomp) = &mut decompressor {
-                        decomp.decompress(&chunk_msg.data)?
-                    } else {
-                        chunk_msg.data
-                    };
-                    // Write chunk also updates the running SHA256 checksum
-                    writer.write_chunk(chunk_index, &final_data).await?;
-                    received += 1;
+                    // Only write+hash new chunks — duplicates corrupt the running SHA256
+                    if is_new {
+                        let final_data = if let Some(decomp) = &mut decompressor {
+                            decomp.decompress(&chunk_msg.data)?
+                        } else {
+                            chunk_msg.data
+                        };
+                        writer.write_chunk(chunk_index, &final_data).await?;
+                    }
 
                     // Ensure ACK send completed before processing next chunk
                     ack_future.await?;
 
-                    // Check if transfer is complete
+                    // Check if transfer is complete (count unique chunks only)
                     if let Some(total) = total_chunks {
-                        trace!("Received chunk {}/{}", received, total);
-                        if received >= total {
+                        let unique = received_set.len() as u64;
+                        trace!("Received chunk {}/{}", unique, total);
+                        if unique >= total {
                             info!("All chunks received, transfer complete");
                             break;
                         }
